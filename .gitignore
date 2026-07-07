@@ -1,3 +1,7 @@
+tmp*.txt
+*.bin
+assets/
+
 build/
 
 .vscode/

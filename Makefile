@@ -9,7 +9,7 @@ ifeq ($(BUILD),debug)
 else
 	CFLAGS := -O2 -DNDEBUG -march=native
 endif
-CFLAGS += -Wall -Wextra -std=c++20
+CFLAGS += -Wall -Wextra -std=c++23
 
 BUILD_DIR := build/$(BUILD)
 OBJ_DIR := $(BUILD_DIR)/obj
