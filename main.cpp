@@ -1,3 +1,4 @@
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
@@ -6,7 +7,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <functional>
 #include <optional>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 #include <expected>
@@ -265,6 +268,10 @@ struct MSF {
     static MSF from_lba(int lba) {
         return from_sector(lba + 150);
     }
+
+    std::string to_str() {
+        return fmt("%02u:%02u:%02u", this->min, this->sec, this->frame);
+    }
 };
 
 struct Track {
@@ -306,7 +313,7 @@ struct TOC {
     u8 last_track;
     std::vector<Track> tracks;
     
-    u8 number_of_tracks() {
+    u8 number_of_tracks() const {
         return last_track - first_track + 1;
     }
 };
@@ -365,7 +372,18 @@ AppRes<TOC> get_toc(int fd) {
 // ---------------------------------------------------------
 // Main
 // ---------------------------------------------------------
+
+// ---
 std::atomic<bool> g_run(true);
+
+void signal_handler(int sig) {
+    switch (sig) {
+        case SIGINT: {
+            g_run = false;
+            break;
+        }
+    }
+}
 
 enum class AppAction {
     Probe,
@@ -374,11 +392,92 @@ enum class AppAction {
     Help
 };
 
+// ---
+struct SectorReader {
+    std::array<byte, RAW_SECTOR_SIZE> raw_data;
+};
+
+inline AppRes<std::span<const byte>> read_sector(int fd, int sector, SectorReader &r) {
+    if (fd < 0) throw std::invalid_argument("Invalid FD");
+
+    const MSF msf = MSF::from_lba(sector);
+
+    struct cdrom_msf msf_;
+    msf_.cdmsf_min0   = msf.min;
+    msf_.cdmsf_sec0   = msf.sec;
+    msf_.cdmsf_frame0 = msf.frame;
+    std::memcpy(r.raw_data.data(), &msf_, sizeof(struct cdrom_msf));
+
+    if (ioctl(fd, CDROMREADRAW, r.raw_data.data()) < 0) {
+        return std::unexpected(AppErr {
+            .code = std::error_code(errno, std::generic_category()),
+            .msg = fmt("Failed to read sector '%d'.", sector)
+        });
+    }
+
+    return std::span(r.raw_data);
+}
+
+// not used anywhere yet
+// inline AppRes<std::span<const byte>> get_logical_sector(int fd, const Track &track, int sector, SectorReader &r) {  // NOTE: doesn't do diagnostics!
+//     if (fd < 0) throw std::invalid_argument("Invalid FD");
+// 
+//     const MSF msf = MSF::from_lba(sector);
+// 
+//     struct cdrom_msf msf_;
+//     msf_.cdmsf_min0   = msf.min;
+//     msf_.cdmsf_sec0   = msf.sec;
+//     msf_.cdmsf_frame0 = msf.frame;
+//     std::memcpy(r.raw_data.data(), &msf_, sizeof(struct cdrom_msf));
+//
+//     if (ioctl(fd, CDROMREADRAW, r.raw_data.data()) < 0) {
+//         return std::unexpected(AppErr {
+//             .code = std::error_code(errno, std::generic_category()),
+//             .msg = fmt("Failed to read sector '%d'.", sector)
+//         });
+//     }
+//
+//     if (track.is_data_track()) {
+//         const u8 mode = r.raw_data[15];
+//         switch (mode) {
+//             case 1: {
+//                 return std::span(r.raw_data.data() + 16, 2048);
+//             }
+//             case 2: {  // assuming only XA
+//                 struct {
+//                     u8 file_num;
+//                     u8 channel_num;
+//                     u8 submode; // eor, video, audio, data, trigger, form, real-time, eof
+//                     u8 coding_info;
+//                 } xa_header = {
+//                     r.raw_data[16],
+//                     r.raw_data[17],
+//                     r.raw_data[18],
+//                     r.raw_data[19],
+//                 };
+//
+//                 u8 xa_form = (xa_header.submode >> 5) & 1;
+//                 switch (xa_form) {
+//                     case 0:  return std::span(r.raw_data.data() + 24, 2048);
+//                     case 1:  return std::span(r.raw_data.data() + 24, 2324);
+//                     default: throw std::runtime_error("TODO: handle this properly. error 2.");
+//                 }
+//             }
+//             default: {
+//                 throw std::runtime_error("TODO: handle this properly. error 1.");
+//             }
+//         }
+//     } else {
+//         return std::span(r.raw_data);
+//     }
+// }
+
+// ---
 AppRes<void> probe(int fd) {
     if (fd < 0) throw std::invalid_argument("Invalid FD");
 
     const auto toc = get_toc(fd);
-    if (!toc) return std::unexpected(toc.error()); 
+    if (!toc) return std::unexpected(toc.error());
 
     printf("First track: %d\n", (*toc).first_track);
     printf("Last track : %d\n\n",  (*toc).last_track);
@@ -396,7 +495,7 @@ AppRes<void> probe(int fd) {
         if (track.is_data_track()) n_data_sectors += n_sectors;
         else n_audio_sectors += n_sectors;
 
-        printf("Track %-2d: %-5s | " MSF_FMT " (%06d) -> " MSF_FMT " (%06d) | " "Duration " MSF_FMT " (%6zu sectors, %8s)\n",
+        printf("Track %2d: %5s | " MSF_FMT " (%06d) -> " MSF_FMT " (%06d) | " "Duration " MSF_FMT " (%6zu sectors, %8s)\n",
             track.num,
             track.is_data_track() ? "data" : "audio",
             start.min, start.sec, start.frame,
@@ -428,6 +527,60 @@ AppRes<void> probe(int fd) {
     return {};
 }
 
+// TODO: written by AI, check and refactor
+AppRes<void> write_cue(const TOC &toc, const std::string &bin_name, const std::string &cue_name) {
+    FILE *f = fopen(cue_name.c_str(), "w");
+    if (!f) {
+        return std::unexpected(AppErr{
+            .code = std::error_code(errno, std::generic_category()),
+            .msg = fmt("Failed to open '%s'.", cue_name.c_str())
+        });
+    }
+
+    fprintf(f, "FILE \"%s\" BINARY\n\n", bin_name.c_str());
+
+    for (const Track &t : toc.tracks) {
+        if (t.is_data_track())
+            fprintf(f, "  TRACK %02u MODE2/2352\n", t.num);
+        else
+            fprintf(f, "  TRACK %02u AUDIO\n", t.num);
+
+        fprintf(f,
+                "    INDEX 01 %s\n\n",
+               t.msf_start().to_str().c_str());
+    }
+
+    fclose(f);
+    return {};
+}
+
+AppRes<void> write_toc(const TOC &toc, const std::string &bin_name, const std::string &toc_name) {
+    FILE *f = fopen(toc_name.c_str(), "w");
+    if (!f) {
+        return std::unexpected(AppErr{
+            .code = std::error_code(errno, std::generic_category()),
+            .msg = fmt("Failed to open '%s'.", toc_name.c_str())
+        });
+    }
+
+    fprintf(f, "CD_ROM\n\n");
+
+    for (const Track &t : toc.tracks) {
+        if (t.is_data_track())
+            fprintf(f, "TRACK MODE2_RAW\n");
+        else
+            fprintf(f, "TRACK AUDIO\n");
+
+        fprintf(f,
+                "    FILE \"%s\" %s\n\n",
+                bin_name.c_str(),
+                t.msf_len().to_str().c_str());
+    }
+
+    fclose(f);
+    return {};
+}
+
 AppRes<void> raw_dump(int fd, bool seperate) {
     using clock = std::chrono::steady_clock;
 
@@ -436,11 +589,11 @@ AppRes<void> raw_dump(int fd, bool seperate) {
     const auto toc = get_toc(fd);
     if (!toc) return std::unexpected(toc.error());
 
-    const auto start = clock::now();
+    const auto _start = clock::now();
 
-    size_t total_sectors = 0, sectors_read = 0;
+    size_t _total_sectors = 0, _sectors_read = 0;
     for (const Track &t : toc->tracks)
-        total_sectors += t.end_sector - t.start_sector + 1;
+        _total_sectors += t.end_sector - t.start_sector + 1;
 
     FILE *f = nullptr;
     if (!seperate) {
@@ -453,6 +606,7 @@ AppRes<void> raw_dump(int fd, bool seperate) {
         }
     }
 
+    SectorReader reader;
     bool complete = true;
     for (const Track &t : toc->tracks) {
         if (!g_run.load()) {
@@ -472,10 +626,6 @@ AppRes<void> raw_dump(int fd, bool seperate) {
             }
         }
 
-        union {
-            struct cdrom_msf msf;
-            byte data[RAW_SECTOR_SIZE];
-        } arg;
         for (int i = t.start_sector; i <= t.end_sector; i++) {
             if (!g_run.load()) {
                 complete = false;
@@ -485,18 +635,13 @@ AppRes<void> raw_dump(int fd, bool seperate) {
 
             const MSF msf = MSF::from_lba(i);
 
-            arg.msf.cdmsf_min0   = msf.min;
-            arg.msf.cdmsf_sec0   = msf.sec;
-            arg.msf.cdmsf_frame0 = msf.frame;
-            if (ioctl(fd, CDROMREADRAW, &arg) < 0) {
+            const auto data = read_sector(fd, i, reader);
+            if (!data) {
                 fclose(f);
-                return std::unexpected(AppErr {
-                    .code = std::error_code(errno, std::generic_category()),
-                    .msg = fmt("Failed to read sector '%d'.", i)
-                });
+                return std::unexpected(data.error());
             }
 
-            if (fwrite(arg.data, 1, RAW_SECTOR_SIZE, f) != RAW_SECTOR_SIZE) {
+            if (fwrite(data->data(), 1, RAW_SECTOR_SIZE, f) != RAW_SECTOR_SIZE) {
                 fclose(f);
                 return std::unexpected(AppErr {
                     .code = std::error_code(errno, std::generic_category()),
@@ -504,27 +649,26 @@ AppRes<void> raw_dump(int fd, bool seperate) {
                 });
             }
 
-            // --- output
+            // output diagnostics
+            ++_sectors_read;
 
-            ++sectors_read;
-
-            const auto now = clock::now();
-            const double elapsed = std::chrono::duration<double>(now - start).count();
-            const double sectors_per_sec = elapsed > 0.0 ? sectors_read / elapsed : 0.0;
-            const double bytes_per_sec = sectors_per_sec * RAW_SECTOR_SIZE;
-            const size_t sectors_left = total_sectors - sectors_read;
-            const double remaining = sectors_per_sec > 0.0 ? sectors_left / sectors_per_sec : 0.0;
+            const auto   _now = clock::now();
+            const double _elapsed = std::chrono::duration<double>(_now - _start).count();
+            const double _sectors_per_sec = _elapsed > 0.0 ? _sectors_read / _elapsed : 0.0;
+            const double _bytes_per_sec = _sectors_per_sec * RAW_SECTOR_SIZE;
+            const size_t _sectors_left = _total_sectors - _sectors_read;
+            const double _remaining = (_sectors_per_sec) > 0.0 ? _sectors_left / _sectors_per_sec : 0.0;
             
             printf(
                 "\33[2K\r" MSF_FMT " (%06d)  %zu/%zu  %.1f sec/s  %s/s  Elapsed %s  ETA %s",
                 msf.min, msf.sec, msf.frame,
                 i,
-                sectors_read,
-                total_sectors,
-                sectors_per_sec,
-                fmt_size(bytes_per_sec).c_str(),
-                fmt_time(elapsed).c_str(),
-                fmt_time(remaining).c_str()
+                _sectors_read,
+                _total_sectors,
+                _sectors_per_sec,
+                fmt_size(_bytes_per_sec).c_str(),
+                fmt_time(_elapsed).c_str(),
+                fmt_time(_remaining).c_str()
             );
             fflush(stdout);
         }
@@ -538,19 +682,163 @@ AppRes<void> raw_dump(int fd, bool seperate) {
     if (!seperate) fclose(f);
 
     if (complete) {
+        if (!seperate) {
+            auto res = write_cue(*toc, "disc.bin", "disc.cue");
+            if (!res) return std::unexpected(res.error());
+            res = write_toc(*toc, "disc.bin", "disc.toc");
+            if (!res) return std::unexpected(res.error());
+        }
+
         printf("\nRaw dump is done.\n");
-        const auto end = clock::now();
-        const double total = std::chrono::duration<double>(end - start).count();
+        const auto   _end = clock::now();
+        const double _total = std::chrono::duration<double>(_end - _start).count();
         printf("\n");
-        printf("Completed in %s\n", fmt_time(total).c_str());
+        printf("Completed in %s\n", fmt_time(_total).c_str());
         printf("Read %zu sectors (%.2f MiB)\n",
-            sectors_read,
-            sectors_read * RAW_SECTOR_SIZE / 1024.0 / 1024.0
+            _sectors_read,
+            _sectors_read * RAW_SECTOR_SIZE / 1024.0 / 1024.0
         );
         printf("Stats: %0.2f sec/s %s/s \n",
-            (double)sectors_read / total,
-            fmt_size(sectors_read * RAW_SECTOR_SIZE / total).c_str()
+            (double)_sectors_read / _total,
+            fmt_size(_sectors_read * RAW_SECTOR_SIZE / _total).c_str()
         );
+    }
+
+    return {};
+}
+
+AppRes<void> extract(int fd) {
+    constexpr byte SYNC[12] = {
+        0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0
+    };
+
+    struct {
+        size_t n_sync_errors;
+        size_t n_msf_mismatch_errors;
+        size_t n_mode1;
+        size_t n_mode2_xa_form1;
+        size_t n_mode2_xa_form2;
+    } diagnostics;
+
+    const std::function<std::span<byte>(byte*)> extract_audio_sector = [&diagnostics](byte *data) {
+        return std::span(data, RAW_SECTOR_SIZE);
+    };
+
+    const std::function<std::span<byte>(byte*)> extract_data_sector = [SYNC, &diagnostics](byte *data) {
+        if (memcmp(data, SYNC, 12) != 0)
+            diagnostics.n_sync_errors++;
+
+        // TODO: msf match check
+
+        const u8 mode = data[15];
+
+        switch (mode) {
+            case 1: {
+                diagnostics.n_mode1++;
+                return std::span(data + 16, 2048);
+            }
+            case 2: {  // assuming only XA mode
+                struct {
+                    u8 file_num;
+                    u8 channel_num;
+                    u8 submode; // eor, video, audio, data, trigger, form, real-time, eof
+                    u8 coding_info;
+                } xa_header = {
+                    data[16],
+                    data[17],
+                    data[18],
+                    data[19],
+                };
+
+                u8 xa_form = (xa_header.submode >> 5) & 1;
+
+                switch (xa_form) {
+                    case 0:  {
+                        diagnostics.n_mode2_xa_form1++;
+                        return std::span(data + 24, 2048);
+                    }
+                    case 1:  {
+                        diagnostics.n_mode2_xa_form2++;
+                        return std::span(data + 24, 2324);
+                    }
+                    default: throw std::runtime_error("TODO: handle this properly. error 2.");
+                }
+            }
+            default: {
+                throw std::runtime_error("TODO: handle this properly. error 1.");
+            }
+        }
+
+        return std::span<byte>(data, RAW_SECTOR_SIZE);
+    };
+
+    if (fd < 0) throw std::invalid_argument("Invalid FD");
+
+    const auto toc = get_toc(fd);
+    if (!toc) return std::unexpected(toc.error());
+    
+    FILE *f = nullptr;
+
+    SectorReader reader;
+    bool complete = true;
+    for (const Track &t : toc->tracks) {
+        if (!g_run.load()) {
+            complete = false;
+            printf("\nStopping safely.\n");
+            break;
+        }
+
+        const auto f_name = fmt("track%02d.%s", t.num, t.is_data_track() ? "data.bin" : "cda.wav");
+        f = fopen(f_name.c_str(), "wb");
+        if (!f) {
+            return std::unexpected(AppErr {
+                .code = std::error_code(errno, std::generic_category()),
+                .msg = fmt("Failed to open '%s'.", f_name.c_str())
+            });
+        }
+
+        const auto& extract_sector = t.is_data_track()
+            ? extract_data_sector
+            : extract_audio_sector;
+
+        for (int i = t.start_sector; i <= t.end_sector; i++) {
+            if (!g_run.load()) {
+                complete = false;
+                printf("\nStopping safely.\n");
+                break;
+            }
+
+            const auto data = read_sector(fd, i, reader);
+            if (!data) {
+                fclose(f);
+                return std::unexpected(data.error());
+            }
+
+            const auto extracted_data = extract_sector(const_cast<byte*>(data->data()));
+
+            if (fwrite(extracted_data.data(), 1, extracted_data.size(), f) != extracted_data.size()) {
+                fclose(f);
+                return std::unexpected(AppErr {
+                    .code = std::error_code(errno, std::generic_category()),
+                    .msg = fmt("Failed to write sector '%d' to file.", i)
+                });
+            }
+
+            printf("\r%d", i);
+            fflush(stdout);
+        }
+
+        fclose(f);
+        f = nullptr;
+    }
+
+    if (complete) {
+        printf("\nDiagnostics:\n");
+        printf("n_sync_errors: %zu\n", diagnostics.n_sync_errors);
+        printf("n_msf_mismatch_errors: %zu\n", diagnostics.n_msf_mismatch_errors);
+        printf("n_mode1: %zu\n", diagnostics.n_mode1);
+        printf("n_mode2_xa_form1: %zu\n", diagnostics.n_mode2_xa_form1);
+        printf("n_mode2_xa_form2: %zu\n", diagnostics.n_mode2_xa_form2);
     }
 
     return {};
@@ -558,15 +846,6 @@ AppRes<void> raw_dump(int fd, bool seperate) {
 
 void help(std::optional<std::string_view>) {
     printf("Sorry. Help not implemented yet.\n");
-}
-
-void signal_handler(int sig) {
-    switch (sig) {
-        case SIGINT: {
-            g_run = false;
-            break;
-        }
-    }
 }
 
 int main(int argc, char* argv[]) {
@@ -592,6 +871,8 @@ int main(int argc, char* argv[]) {
             printf("Usage: %s raw <flags>\nFlags:\n  -s\t Dump each track seperately.", args[0].data());
             return 1;
         }
+    } else if (args[1] == "extract") {
+        action = AppAction::Extract;
     } else if (args[1] == "help") {
         action = AppAction::Help;
         if (argc > 3) {
@@ -646,6 +927,10 @@ int main(int argc, char* argv[]) {
         }
         case AppAction::RawDump: {
             res = raw_dump(fd, _raw_seperate);
+            break;
+        }
+        case AppAction::Extract: {
+            res = extract(fd);
             break;
         }
         case AppAction::Help:
