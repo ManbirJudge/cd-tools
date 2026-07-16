@@ -1,5 +1,7 @@
 # My CD Tools
 ## TODOs
-- Output TOC in raw (unseperated) mode.
 - Match diagnostic output among all modes.
 - Have dedicated modes for - raw sector dump, logical user data dump and then interpretation modes like - interperating audio cds as .wav files and interpretting vcds and svcds (identifcation can be - iso9960 fs + standard file structure) (svcds are interesting because the video is in a sperate data track, differetn from the fs) and interpretting normal data cds. these the are the main types of discs i have personally came accross. i can maybe take a look into some other foramts and dvds, but above is the minimum.
+- proper cue and toc parsing and writing.
+- bin/cue and bin/toc sources.
+- `CDROM_CHANGER_STATUS`

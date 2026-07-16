@@ -1,24 +1,24 @@
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <chrono>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <expected>
 #include <functional>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
-#include <vector>
-#include <expected>
 #include <system_error>
-#include <atomic>
-#include <csignal>
+#include <vector>
 
-#include <fcntl.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/ioctl.h>
 #include <linux/cdrom.h>
 
@@ -35,7 +35,7 @@ typedef size_t   usize;
 typedef uint8_t byte;
 
 // ---------------------------------------------------------
-// Errors
+// Error
 // ---------------------------------------------------------
 
 struct AppErr {
@@ -52,13 +52,9 @@ using AppRes = std::expected<T, AppErr>;
 
 #define bcd_to_bin(x) ((((x) >> 4) * 10) + ((x) & 0x0F))
 
-#define MSF_FMT "%02d:%02d:%02d"
+// --- string formating
 
-void print_hex(byte *data, size_t n) {
-    for (size_t i = 0; i < n; i++) {
-        printf("%02x ", data[i]);
-    }
-}
+#define MSF_FMT "%02d:%02d:%02d"
 
 template<typename... Args>
 std::string fmt(const char *fmt, Args... args) {
@@ -109,51 +105,6 @@ std::string fmt_size(size_t bytes) {
 // [name not found]
 // ---------------------------------------------------------
 
-// --- drive capabilties
-
-struct DriveCapabilities {
-    bool can_play_audio;
-    struct {
-        bool cd_r;
-        bool cd_rw;
-        bool dvd_r;
-    } read_capabilities;
-    bool supports_multicession;
-};
-
-AppRes<DriveCapabilities> get_drive_capabilities(int fd) {
-    if (fd < 0) throw std::invalid_argument("Invalid FD");
-
-    int drive_cap = ioctl(fd, CDROM_GET_CAPABILITY);
-    if (drive_cap < 0) {
-        return std::unexpected(AppErr {
-            .code = std::error_code(errno, std::generic_category()),
-            .msg = "Failed to get drive capabilities."
-        });
-    }
-
-    return DriveCapabilities {
-        (drive_cap & CDC_PLAY_AUDIO) != 0,
-        {
-            (drive_cap & CDC_CD_R) != 0,
-            (drive_cap & CDC_CD_RW) != 0,
-            (drive_cap & CDC_DVD_R) != 0
-        },
-        (drive_cap & CDC_MULTI_SESSION) != 0
-    };
-}
-
-// --- drive status
-
-// enum DriveStatus : int {
-//     NoInfo   = CDS_NO_INFO,
-//     NoDisc   = CDS_NO_DISC,
-//     TrayOpen = CDS_TRAY_OPEN,
-//     NotReady = CDS_DRIVE_NOT_READY,
-//     DiscOk   = CDS_DISC_OK,
-//     Unknown  = -1
-// };
-
 namespace DriveStatus {
     enum type: int {
         NoInfo   = CDS_NO_INFO,
@@ -177,76 +128,7 @@ namespace DriveStatus {
     }
 }
 
-AppRes<DriveStatus::type> get_drive_status(int fd) {
-    if (fd < 0) throw std::invalid_argument("Invalid FD");
-
-    int stat = ioctl(fd, CDROM_DRIVE_STATUS);
-    if (stat < 0) {
-        return std::unexpected(AppErr {
-            .code = std::error_code(errno, std::generic_category()),
-            .msg = "Failed to get drive status."
-        });
-    }
-
-    switch (stat) {
-        case DriveStatus::NoInfo  : return DriveStatus::NoInfo  ;
-        case DriveStatus::NoDisc  : return DriveStatus::NoDisc  ;
-        case DriveStatus::TrayOpen: return DriveStatus::TrayOpen;
-        case DriveStatus::NotReady: return DriveStatus::NotReady;
-        case DriveStatus::DiscOk  : return DriveStatus::DiscOk  ;
-        default                   : return DriveStatus::Unknown ;
-    }
-}
-
-// --- disc status
-
-namespace DiscType {
-    enum type : int {
-        Audio               = CDS_AUDIO,
-        Data_Mode1          = CDS_DATA_1,
-        Data_Mode2          = CDS_DATA_2,
-        Data_Mode2_XA_Form1 = CDS_XA_2_1,
-        Data_Mode2_XA_Form2 = CDS_XA_2_2,
-        Mixed               = CDS_MIXED,
-        Unknown             = -1
-    };
-
-    constexpr std::string_view to_str(type disc_type) {
-        switch (disc_type) {
-            case Audio:               return "Audio";
-            case Data_Mode1:          return "Mode 1";
-            case Data_Mode2:          return "Mode 2";
-            case Data_Mode2_XA_Form1: return "Mode 2 XA (Form 1)";
-            case Data_Mode2_XA_Form2: return "Mode 2 XA (Form 2)";
-            case Mixed:               return "Mixed";
-            case Unknown:             return "Unknown";
-        }
-    }
-}
-
-AppRes<DiscType::type> get_disc_type(int fd) {
-    if (fd < 0) throw std::invalid_argument("Invalid FD");
-
-    int disc_stat = ioctl(fd, CDROM_DISC_STATUS);
-    if (disc_stat < 0) {
-        return std::unexpected(AppErr {
-            .code = std::error_code(errno, std::generic_category()),
-            .msg = "Failed to get drive status."
-        });
-    }
-
-    switch (disc_stat) {
-        case CDS_AUDIO:  return DiscType::Audio;
-        case CDS_DATA_1: return DiscType::Data_Mode1;
-        case CDS_DATA_2: return DiscType::Data_Mode2;
-        case CDS_XA_2_1: return DiscType::Data_Mode2_XA_Form1;
-        case CDS_XA_2_2: return DiscType::Data_Mode2_XA_Form2;
-        case CDS_MIXED:  return DiscType::Mixed;
-        default:         return DiscType::Unknown;
-    }
-}
-
-// --- tracks and TOC
+// --- TOC
 
 // structs
 struct MSF {
@@ -319,215 +201,6 @@ struct TOC {
 };
 
 // functions
-AppRes<TOC> get_toc(int fd) {
-    if (fd < 0) throw std::invalid_argument("Invalid FD");  // should be an exception because this is huge logical error, not expected
-
-    TOC toc;
-
-    struct cdrom_tochdr toc_header;
-    if (ioctl(fd, CDROMREADTOCHDR, &toc_header) < 0) {
-        return std::unexpected(AppErr {
-            .code = std::error_code(errno, std::generic_category()),
-            .msg = "Failed to read TOC header."
-        });
-    }
-
-    toc.first_track = toc_header.cdth_trk0;
-    toc.last_track = toc_header.cdth_trk1;
-
-    struct cdrom_tocentry toc_entry;
-    toc_entry.cdte_format = CDROM_LBA;
-    for (u8 i = toc.first_track; i <= toc.last_track; i++) {
-        toc_entry.cdte_track = i;
-        if (ioctl(fd, CDROMREADTOCENTRY, &toc_entry) < 0) {
-            return std::unexpected(AppErr {
-                .code = std::error_code(errno, std::generic_category()),
-                .msg = fmt("Failed to read TOC entry for track %d.", i)
-            });
-        }
-        
-        if (i > toc.first_track) toc.tracks.back().end_sector = toc_entry.cdte_addr.lba - 1;
-
-        toc.tracks.emplace_back(
-            i,
-            toc_entry.cdte_addr.lba, -1,
-            (u8)toc_entry.cdte_ctrl
-        );
-    }
-
-    if (!toc.tracks.empty()) {
-        toc_entry.cdte_track = CDROM_LEADOUT;
-        if (ioctl(fd, CDROMREADTOCENTRY, &toc_entry) < 0) {
-            return std::unexpected(AppErr {
-                .code = std::error_code(errno, std::generic_category()),
-                .msg = "Failed to read TOC entry for leadout."
-            });
-        }
-        toc.tracks.back().end_sector = toc_entry.cdte_addr.lba - 1;
-    }
-
-    return toc;
-}
-
-// ---------------------------------------------------------
-// Main
-// ---------------------------------------------------------
-
-// ---
-std::atomic<bool> g_run(true);
-
-void signal_handler(int sig) {
-    switch (sig) {
-        case SIGINT: {
-            g_run = false;
-            break;
-        }
-    }
-}
-
-enum class AppAction {
-    Probe,
-    RawDump,
-    Extract,
-    Help
-};
-
-// ---
-struct SectorReader {
-    std::array<byte, RAW_SECTOR_SIZE> raw_data;
-};
-
-inline AppRes<std::span<const byte>> read_sector(int fd, int sector, SectorReader &r) {
-    if (fd < 0) throw std::invalid_argument("Invalid FD");
-
-    const MSF msf = MSF::from_lba(sector);
-
-    struct cdrom_msf msf_;
-    msf_.cdmsf_min0   = msf.min;
-    msf_.cdmsf_sec0   = msf.sec;
-    msf_.cdmsf_frame0 = msf.frame;
-    std::memcpy(r.raw_data.data(), &msf_, sizeof(struct cdrom_msf));
-
-    if (ioctl(fd, CDROMREADRAW, r.raw_data.data()) < 0) {
-        return std::unexpected(AppErr {
-            .code = std::error_code(errno, std::generic_category()),
-            .msg = fmt("Failed to read sector '%d'.", sector)
-        });
-    }
-
-    return std::span(r.raw_data);
-}
-
-// not used anywhere yet
-// inline AppRes<std::span<const byte>> get_logical_sector(int fd, const Track &track, int sector, SectorReader &r) {  // NOTE: doesn't do diagnostics!
-//     if (fd < 0) throw std::invalid_argument("Invalid FD");
-// 
-//     const MSF msf = MSF::from_lba(sector);
-// 
-//     struct cdrom_msf msf_;
-//     msf_.cdmsf_min0   = msf.min;
-//     msf_.cdmsf_sec0   = msf.sec;
-//     msf_.cdmsf_frame0 = msf.frame;
-//     std::memcpy(r.raw_data.data(), &msf_, sizeof(struct cdrom_msf));
-//
-//     if (ioctl(fd, CDROMREADRAW, r.raw_data.data()) < 0) {
-//         return std::unexpected(AppErr {
-//             .code = std::error_code(errno, std::generic_category()),
-//             .msg = fmt("Failed to read sector '%d'.", sector)
-//         });
-//     }
-//
-//     if (track.is_data_track()) {
-//         const u8 mode = r.raw_data[15];
-//         switch (mode) {
-//             case 1: {
-//                 return std::span(r.raw_data.data() + 16, 2048);
-//             }
-//             case 2: {  // assuming only XA
-//                 struct {
-//                     u8 file_num;
-//                     u8 channel_num;
-//                     u8 submode; // eor, video, audio, data, trigger, form, real-time, eof
-//                     u8 coding_info;
-//                 } xa_header = {
-//                     r.raw_data[16],
-//                     r.raw_data[17],
-//                     r.raw_data[18],
-//                     r.raw_data[19],
-//                 };
-//
-//                 u8 xa_form = (xa_header.submode >> 5) & 1;
-//                 switch (xa_form) {
-//                     case 0:  return std::span(r.raw_data.data() + 24, 2048);
-//                     case 1:  return std::span(r.raw_data.data() + 24, 2324);
-//                     default: throw std::runtime_error("TODO: handle this properly. error 2.");
-//                 }
-//             }
-//             default: {
-//                 throw std::runtime_error("TODO: handle this properly. error 1.");
-//             }
-//         }
-//     } else {
-//         return std::span(r.raw_data);
-//     }
-// }
-
-// ---
-AppRes<void> probe(int fd) {
-    if (fd < 0) throw std::invalid_argument("Invalid FD");
-
-    const auto toc = get_toc(fd);
-    if (!toc) return std::unexpected(toc.error());
-
-    printf("First track: %d\n", (*toc).first_track);
-    printf("Last track : %d\n\n",  (*toc).last_track);
-
-    usize n_data_sectors = 0;
-    usize n_audio_sectors = 0;
-
-    for (const Track &track : (*toc).tracks) {
-        const MSF start = track.msf_start();
-        const MSF end   = track.msf_end();
-        const MSF len   = track.msf_len();
-
-        const usize n_sectors = track.len();
-
-        if (track.is_data_track()) n_data_sectors += n_sectors;
-        else n_audio_sectors += n_sectors;
-
-        printf("Track %2d: %5s | " MSF_FMT " (%06d) -> " MSF_FMT " (%06d) | " "Duration " MSF_FMT " (%6zu sectors, %8s)\n",
-            track.num,
-            track.is_data_track() ? "data" : "audio",
-            start.min, start.sec, start.frame,
-            track.start_sector,
-            end.min, end.sec, end.frame,
-            track.end_sector,
-            len.min, len.sec, len.frame,
-            n_sectors,
-            fmt_size(n_sectors * RAW_SECTOR_SIZE).c_str()
-        );
-    }
-
-    printf("\n");
-    printf("========== Totals ==========\n");
-    printf("Tracks       : %zu\n", toc->tracks.size());
-    printf("Data sectors : %zu (%s)\n",
-        n_data_sectors,
-        fmt_size(n_data_sectors * RAW_SECTOR_SIZE).c_str()
-    );
-    printf("Audio sectors: %zu (%s)\n",
-        n_audio_sectors,
-        fmt_size(n_audio_sectors * RAW_SECTOR_SIZE).c_str()
-    );
-    printf("Total sectors: %zu (%s)\n",
-        n_data_sectors + n_audio_sectors,
-        fmt_size((n_data_sectors + n_audio_sectors) * RAW_SECTOR_SIZE).c_str()
-    );
-
-    return {};
-}
-
-// TODO: written by AI, check and refactor
 AppRes<void> write_cue(const TOC &toc, const std::string &bin_name, const std::string &cue_name) {
     FILE *f = fopen(cue_name.c_str(), "w");
     if (!f) {
@@ -581,18 +254,338 @@ AppRes<void> write_toc(const TOC &toc, const std::string &bin_name, const std::s
     return {};
 }
 
-AppRes<void> raw_dump(int fd, bool seperate) {
+// ---------------------------------------------------------
+// Reading
+// ---------------------------------------------------------
+
+// --- sector reader
+struct SectorReader {
+    std::array<byte, RAW_SECTOR_SIZE> raw_data;
+};
+
+// --- sector source
+class SectorSource {
+protected:
+    TOC m_toc;
+
+    bool m_is_ready;
+    std::string m_reason;
+
+    SectorSource(bool raw, bool logical) : can_read_raw(raw), can_read_logical(logical) {}
+
+    void set_toc(const TOC toc) {
+        m_toc = toc;
+    }
+
+public:
+    const bool can_read_raw;
+    const bool can_read_logical;
+
+    std::pair<bool, std::string> is_ready() const noexcept {
+       return { m_is_ready, m_reason };
+    };
+
+    TOC get_toc() const noexcept { return m_toc; };
+
+    virtual AppRes<std::span<const byte>> read_sector(int sector, SectorReader &r) = 0;
+    virtual AppRes<std::span<const byte>> read_logical_sector(int sector, SectorReader &r) = 0;
+
+    virtual ~SectorSource() = default;
+};
+
+// CD source
+class CDSource : public SectorSource {
+    int fd = -1;
+
+    AppRes<DriveStatus::type> read_drive_status() {
+        int stat = ioctl(this->fd, CDROM_DRIVE_STATUS);
+        if (stat < 0) {
+            return std::unexpected(AppErr {
+                .code = std::error_code(errno, std::generic_category()),
+                .msg = "Failed to get drive status."
+            });
+        }
+
+        switch (stat) {
+            case DriveStatus::NoInfo  : return DriveStatus::NoInfo  ;
+            case DriveStatus::NoDisc  : return DriveStatus::NoDisc  ;
+            case DriveStatus::TrayOpen: return DriveStatus::TrayOpen;
+            case DriveStatus::NotReady: return DriveStatus::NotReady;
+            case DriveStatus::DiscOk  : return DriveStatus::DiscOk  ;
+            default                   : return DriveStatus::Unknown ;
+        }
+    }
+
+    AppRes<TOC> read_toc() {
+        TOC toc;
+
+        struct cdrom_tochdr toc_header;
+        if (ioctl(this->fd, CDROMREADTOCHDR, &toc_header) < 0) {
+            return std::unexpected(AppErr {
+                .code = std::error_code(errno, std::generic_category()),
+                .msg = "Failed to read TOC header."
+            });
+        }
+
+        toc.first_track = toc_header.cdth_trk0;
+        toc.last_track = toc_header.cdth_trk1;
+
+        struct cdrom_tocentry toc_entry;
+        toc_entry.cdte_format = CDROM_LBA;
+        for (u8 i = toc.first_track; i <= toc.last_track; i++) {
+            toc_entry.cdte_track = i;
+            if (ioctl(this->fd, CDROMREADTOCENTRY, &toc_entry) < 0) {
+                return std::unexpected(AppErr {
+                    .code = std::error_code(errno, std::generic_category()),
+                    .msg = fmt("Failed to read TOC entry for track %d.", i)
+                });
+            }
+            
+            if (i > toc.first_track) toc.tracks.back().end_sector = toc_entry.cdte_addr.lba - 1;
+
+            toc.tracks.emplace_back(
+                i,
+                toc_entry.cdte_addr.lba, -1,
+                (u8)toc_entry.cdte_ctrl
+            );
+        }
+
+        if (!toc.tracks.empty()) {
+            toc_entry.cdte_track = CDROM_LEADOUT;
+            if (ioctl(this->fd, CDROMREADTOCENTRY, &toc_entry) < 0) {
+                return std::unexpected(AppErr {
+                    .code = std::error_code(errno, std::generic_category()),
+                    .msg = "Failed to read TOC entry for leadout."
+                });
+            }
+            toc.tracks.back().end_sector = toc_entry.cdte_addr.lba - 1;
+        }
+
+        return toc;
+    }
+
+public:
+    explicit CDSource(const std::string_view dev_path) : SectorSource(true, false) {
+        this->fd = open(dev_path.data(), O_RDONLY | O_NONBLOCK);
+        if (this->fd < 0) {
+            m_is_ready = false;
+            m_reason = std::string("Failed to open device: ") + dev_path.data();
+            return;
+        }
+
+        auto drive_status = this->read_drive_status();
+        if (!drive_status) {
+            const auto err = drive_status.error();
+
+            m_is_ready = false;
+            m_reason = fmt("Error: %s\n  Code %d: %s\n",
+                err.msg.c_str(),
+                err.code.value(), err.code.message().c_str()
+            );
+
+            return;
+        }
+        if (drive_status != DriveStatus::DiscOk) {
+            m_is_ready = false;
+            m_reason = fmt("Disc not readable. Current status: %s\n", DriveStatus::to_str(*drive_status).data());
+
+            return;
+        }
+
+        const auto toc = this->read_toc();
+        if (!toc) {
+            const auto err = toc.error();
+
+            m_is_ready = false;
+            m_reason = fmt("Error: %s\n  Code %d: %s\n",
+                err.msg.c_str(),
+                err.code.value(), err.code.message().c_str()
+            );
+
+            return;
+        }
+        m_toc = toc.value();
+
+        m_is_ready = true;
+    }
+
+    CDSource(const CDSource&) = delete;
+    CDSource(CDSource&& other) noexcept : SectorSource(true, false), fd(other.fd) { other.fd = -1; }
+    CDSource& operator=(const CDSource&) = delete;
+    CDSource& operator=(CDSource&& other) noexcept {
+        if (this != &other) {
+            if (this->fd >= 0) ::close(fd);
+            this->fd = other.fd;
+            other.fd = -1;
+        }
+        return *this;
+    }
+
+    AppRes<std::span<const byte>> read_sector(int sector, SectorReader &r) override {
+        if (this->fd < 0) throw std::invalid_argument("Invalid FD");
+
+        const MSF msf = MSF::from_lba(sector);
+
+        struct cdrom_msf msf_;
+        msf_.cdmsf_min0   = msf.min;
+        msf_.cdmsf_sec0   = msf.sec;
+        msf_.cdmsf_frame0 = msf.frame;
+        std::memcpy(r.raw_data.data(), &msf_, sizeof(struct cdrom_msf));
+
+        if (ioctl(fd, CDROMREADRAW, r.raw_data.data()) < 0) {
+            return std::unexpected(AppErr {
+                .code = std::error_code(errno, std::generic_category()),
+                .msg = fmt("Failed to read sector '%d'.", sector)
+            });
+        }
+
+        return std::span(r.raw_data);
+    }
+    
+    AppRes<std::span<const byte>> read_logical_sector(int, SectorReader&) override {
+        throw std::logic_error("Can't read logical sectors from CD source.");
+    }
+
+    ~CDSource() override {
+        if (this->fd >= 0) ::close(this->fd);
+        this->fd = -1;
+    }
+};
+
+// .bin + .cue source
+// class BinSource : public SectorSource {
+//     FILE *f = nullptr;
+// 
+// public:
+//     explicit BinSource(const std::string_view bin_path, const std::string_view cue_path) : SectorSource(true, false) {
+//         this->f = fopen(bin_path.data(), "rb");
+//         if (!this->f) {
+//             m_is_ready = false;
+//             m_reason = std::string("Failed to open file: ") + bin_path.data();
+//             return;
+//         }
+// 
+//         // ---
+//         FILE *cue_f = fopen(cue_path.data(), "r");
+//         if (!cue_f) {
+//             m_is_ready = false;
+//             m_reason = std::string("Failed to open file: ") + cue_path.data();
+//             return;
+//         }
+// 
+//         // read toc
+//     }
+// 
+//     BinSource(const BinSource&) = delete;
+//     BinSource(BinSource&& other) noexcept : SectorSource(true, false), f(other.f) { other.f = nullptr; }
+//     BinSource& operator=(const BinSource&) = delete;
+//     BinSource& operator=(BinSource&& other) noexcept {
+//         if (this != &other) {
+//             if (this->f) fclose(f);
+//             this->f = other.f;
+//             other.f = nullptr;
+//         }
+//         return *this;
+//     }
+// 
+//     AppRes<std::span<const byte>> read_sector(int, SectorReader&) override {
+//         if (!this->f) throw std::runtime_error("File not open.");
+//         throw std::runtime_error("Not implemetned yet.");
+//     }
+//     
+//     AppRes<std::span<const byte>> read_logical_sector(int, SectorReader&) override {
+//         throw std::logic_error("Not implemented yet.");
+//     }
+// 
+//     void close() override {
+//         if (this->f) fclose(this->f);
+//         this->f = nullptr;
+//     }
+// };
+
+// ---------------------------------------------------------
+// Main
+// ---------------------------------------------------------
+
+std::atomic<bool> g_run(true);
+
+void signal_handler(int sig) {
+    switch (sig) {
+        case SIGINT: {
+            g_run = false;
+            break;
+        }
+    }
+}
+
+// actions
+enum class AppAction {
+    Probe,
+    RawDump,
+    Extract,
+    Help
+};
+
+AppRes<void> probe(SectorSource &src) {
+    const TOC toc = src.get_toc();
+
+    printf("First track: %d\n", toc.first_track);
+    printf("Last track : %d\n\n",  toc.last_track);
+
+    usize n_data_sectors = 0;
+    usize n_audio_sectors = 0;
+
+    for (const Track &track : toc.tracks) {
+        const MSF start = track.msf_start();
+        const MSF end   = track.msf_end();
+        const MSF len   = track.msf_len();
+
+        const usize n_sectors = track.len();
+
+        if (track.is_data_track()) n_data_sectors += n_sectors;
+        else n_audio_sectors += n_sectors;
+
+        printf("Track %2d: %5s | " MSF_FMT " (%06d) -> " MSF_FMT " (%06d) | " "Duration " MSF_FMT " (%6zu sectors, %8s)\n",
+            track.num,
+            track.is_data_track() ? "data" : "audio",
+            start.min, start.sec, start.frame,
+            track.start_sector,
+            end.min, end.sec, end.frame,
+            track.end_sector,
+            len.min, len.sec, len.frame,
+            n_sectors,
+            fmt_size(n_sectors * RAW_SECTOR_SIZE).c_str()
+        );
+    }
+
+    printf("\n");
+    printf("========== Totals ==========\n");
+    printf("Tracks       : %zu\n", toc.tracks.size());
+    printf("Data sectors : %zu (%s)\n",
+        n_data_sectors,
+        fmt_size(n_data_sectors * RAW_SECTOR_SIZE).c_str()
+    );
+    printf("Audio sectors: %zu (%s)\n",
+        n_audio_sectors,
+        fmt_size(n_audio_sectors * RAW_SECTOR_SIZE).c_str()
+    );
+    printf("Total sectors: %zu (%s)\n",
+        n_data_sectors + n_audio_sectors,
+        fmt_size((n_data_sectors + n_audio_sectors) * RAW_SECTOR_SIZE).c_str()
+    );
+
+    return {};
+}
+
+AppRes<void> raw_dump(SectorSource &src, bool seperate) {
     using clock = std::chrono::steady_clock;
 
-    if (fd < 0) throw std::invalid_argument("Invalid FD");
-
-    const auto toc = get_toc(fd);
-    if (!toc) return std::unexpected(toc.error());
+    const TOC toc = src.get_toc();
 
     const auto _start = clock::now();
 
     size_t _total_sectors = 0, _sectors_read = 0;
-    for (const Track &t : toc->tracks)
+    for (const Track &t : toc.tracks)
         _total_sectors += t.end_sector - t.start_sector + 1;
 
     FILE *f = nullptr;
@@ -608,7 +601,7 @@ AppRes<void> raw_dump(int fd, bool seperate) {
 
     SectorReader reader;
     bool complete = true;
-    for (const Track &t : toc->tracks) {
+    for (const Track &t : toc.tracks) {
         if (!g_run.load()) {
             complete = false;
             printf("\nStopping safely.\n");
@@ -635,7 +628,7 @@ AppRes<void> raw_dump(int fd, bool seperate) {
 
             const MSF msf = MSF::from_lba(i);
 
-            const auto data = read_sector(fd, i, reader);
+            const auto data = src.read_sector(i, reader);
             if (!data) {
                 fclose(f);
                 return std::unexpected(data.error());
@@ -683,9 +676,9 @@ AppRes<void> raw_dump(int fd, bool seperate) {
 
     if (complete) {
         if (!seperate) {
-            auto res = write_cue(*toc, "disc.bin", "disc.cue");
+            auto res = write_cue(toc, "disc.bin", "disc.cue");
             if (!res) return std::unexpected(res.error());
-            res = write_toc(*toc, "disc.bin", "disc.toc");
+            res = write_toc(toc, "disc.bin", "disc.toc");
             if (!res) return std::unexpected(res.error());
         }
 
@@ -707,7 +700,7 @@ AppRes<void> raw_dump(int fd, bool seperate) {
     return {};
 }
 
-AppRes<void> extract(int fd) {
+AppRes<void> extract(SectorSource &src) {
     constexpr byte SYNC[12] = {
         0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0
     };
@@ -772,16 +765,13 @@ AppRes<void> extract(int fd) {
         return std::span<byte>(data, RAW_SECTOR_SIZE);
     };
 
-    if (fd < 0) throw std::invalid_argument("Invalid FD");
-
-    const auto toc = get_toc(fd);
-    if (!toc) return std::unexpected(toc.error());
+    const TOC toc = src.get_toc();
     
     FILE *f = nullptr;
 
     SectorReader reader;
     bool complete = true;
-    for (const Track &t : toc->tracks) {
+    for (const Track &t : toc.tracks) {
         if (!g_run.load()) {
             complete = false;
             printf("\nStopping safely.\n");
@@ -808,7 +798,7 @@ AppRes<void> extract(int fd) {
                 break;
             }
 
-            const auto data = read_sector(fd, i, reader);
+            const auto data = src.read_sector(i, reader);
             if (!data) {
                 fclose(f);
                 return std::unexpected(data.error());
@@ -848,6 +838,7 @@ void help(std::optional<std::string_view>) {
     printf("Sorry. Help not implemented yet.\n");
 }
 
+// entry point
 int main(int argc, char* argv[]) {
     // command line args parsing
     std::vector<std::string_view> args(argv, argv + argc);
@@ -892,28 +883,12 @@ int main(int argc, char* argv[]) {
     }
 
     // ---
-    int fd = open("/dev/sr0", O_RDONLY | O_NONBLOCK);
-    if (fd < 0) {
-        perror("Failed to open drive"); // definitely goes in stderr
-        return 2;
-    }
+    CDSource src("/dev/sr0");
 
-    // ---
-    auto drive_status = get_drive_status(fd);
-    if (!drive_status) {
-        const auto err = drive_status.error();
-        printf("Error: %s\n  Code %d: %s\n",
-            err.msg.c_str(),
-            err.code.value(), err.code.message().c_str()
-        );
-        close(fd);
-        return 10;
-    }
-
-    if (drive_status != DriveStatus::DiscOk) {
-        fprintf(stderr, "Error: Disc not readable. Current status: %s\n", DriveStatus::to_str(*drive_status).data()); // should this go in stdout or stderr - when the cd/dvd drive isn't ready - whether its open, initalizing or anything except ready
-        close(fd);
-        return 3;
+    const auto status = src.is_ready();
+    if (!status.first) {
+        printf("Source not ready:\n%s\n", status.second.data());
+        return 67;
     }
     
     // ---
@@ -922,15 +897,15 @@ int main(int argc, char* argv[]) {
     AppRes<void> res;
     switch (action) {
         case AppAction::Probe: {
-            res = probe(fd);
+            res = probe(src);
             break;
         }
         case AppAction::RawDump: {
-            res = raw_dump(fd, _raw_seperate);
+            res = raw_dump(src, _raw_seperate);
             break;
         }
         case AppAction::Extract: {
-            res = extract(fd);
+            res = extract(src);
             break;
         }
         case AppAction::Help:
@@ -946,6 +921,5 @@ int main(int argc, char* argv[]) {
     }
 
     // ---
-    close(fd);
     return 0;
 }
