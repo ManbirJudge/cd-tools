@@ -347,7 +347,7 @@ public:
                 return;
             }
 
-            const int start_lba = t.indices.front().msf.to_sector();
+            const int start_lba = t.indices.front().msf.to_lba();
 
             if (!m_toc.tracks.empty()) m_toc.tracks.back().end_lba = start_lba - 1;
             m_toc.tracks.emplace_back(
