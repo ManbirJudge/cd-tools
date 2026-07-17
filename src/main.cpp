@@ -4,17 +4,16 @@
 #include <chrono>
 #include <csignal>
 #include <cstddef>
-#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <expected>
+#include <filesystem>
 #include <functional>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
-#include <system_error>
 #include <vector>
 
 #include <unistd.h>
@@ -22,78 +21,11 @@
 #include <sys/ioctl.h>
 #include <linux/cdrom.h>
 
-// ---------------------------------------------------------
-// Types
-// ---------------------------------------------------------
+#include "cue.hpp"
+#include "error.hpp"
+#include "toc.hpp"
 
-typedef uint8_t  u8;
-typedef uint16_t u16;
-typedef uint32_t u32;
-typedef uint64_t u64;
-typedef size_t   usize;
-
-typedef uint8_t byte;
-
-// ---------------------------------------------------------
-// Error
-// ---------------------------------------------------------
-
-struct AppErr {
-    std::error_code code;
-    std::string msg;
-};
-
-template <typename T>
-using AppRes = std::expected<T, AppErr>;
-
-// ---------------------------------------------------------
-// Utils
-// ---------------------------------------------------------
-
-#define bcd_to_bin(x) ((((x) >> 4) * 10) + ((x) & 0x0F))
-
-// --- string formating
-
-#define MSF_FMT "%02d:%02d:%02d"
-
-template<typename... Args>
-std::string fmt(const char *fmt, Args... args) {
-    int size_s = std::snprintf(nullptr, 0, fmt, args...) + 1; 
-    if (size_s <= 0) return "";
-    
-    auto size = static_cast<size_t>(size_s);
-
-    std::string str;
-    str.resize(size);
-
-    std::snprintf(str.data(), size + 1, fmt, args...);
-    
-    return str;
-}
-
-std::string fmt_time(int s) {
-    int h = s / 3600;
-    s %= 3600;
-
-    int m = s / 60;
-    s %= 60;
-
-    if (h) return fmt("%02d:%02d:%02d", h, m, s);
-    return fmt("%02d:%02d", m, s);
-}
-
-std::string fmt_size(size_t bytes) {
-    constexpr double KiB = 1024.0;
-    constexpr double MiB = KiB * 1024.0;
-    constexpr double GiB = MiB * 1024.0;
-    constexpr double TiB = GiB * 1024.0;
-
-    if (bytes >= TiB) return fmt("%.2f TiB", (double)bytes / TiB);
-    if (bytes >= GiB) return fmt("%.2f GiB", (double)bytes / GiB);
-    if (bytes >= MiB) return fmt("%.2f MiB", (double)bytes / MiB);
-    if (bytes >= KiB) return fmt("%.2f KiB", (double)bytes / KiB);
-    return fmt("%zu B", bytes);
-}
+namespace fs = std::filesystem;
 
 // ---------------------------------------------------------
 // Definitions
@@ -126,132 +58,6 @@ namespace DriveStatus {
         }
         __builtin_unreachable();
     }
-}
-
-// --- TOC
-
-// structs
-struct MSF {
-    u8 min, sec, frame;
-
-    bool operator==(const MSF& other) const = default;
-    
-    static MSF from_sector(int sector) {
-        u8 min = static_cast<u8>(sector / (60 * 75));
-        sector %= 60 * 75;
-
-        return {
-            min,
-            static_cast<u8>(sector / 75),
-            static_cast<u8>(sector % 75)
-        };
-    }
-
-    static MSF from_lba(int lba) {
-        return from_sector(lba + 150);
-    }
-
-    std::string to_str() {
-        return fmt("%02u:%02u:%02u", this->min, this->sec, this->frame);
-    }
-};
-
-struct Track {
-    u8 num;
-    int start_sector, end_sector;
-    u8 flags;
-    MSF msf_start() const {
-        return MSF::from_lba(this->start_sector);
-    }
-    MSF msf_end() const {
-        return MSF::from_lba(this->end_sector);
-    }
-    bool is_data_track() const {
-        return this->flags & CDROM_DATA_TRACK;
-    }
-    int len() const {
-        return end_sector - start_sector + 1;
-    }
-    MSF msf_len() const {
-        return MSF::from_sector(this->len());
-    }
-
-    // struct {
-    //     size_t sync_err_count;
-    //     size_t msf_err_count;
-    //     size_t edc_err_count;
-    //     size_t other_err_count;
-
-    //     size_t mode1_count;
-    //     size_t mode2_count;
-    //     size_t mode2_plain_count;
-    //     size_t mode2_xa1_count;
-    //     size_t mode2_xa2_count;
-    // } diagnostics;
-};
-
-struct TOC {
-    u8 first_track;
-    u8 last_track;
-    std::vector<Track> tracks;
-    
-    u8 number_of_tracks() const {
-        return last_track - first_track + 1;
-    }
-};
-
-// functions
-AppRes<void> write_cue(const TOC &toc, const std::string &bin_name, const std::string &cue_name) {
-    FILE *f = fopen(cue_name.c_str(), "w");
-    if (!f) {
-        return std::unexpected(AppErr{
-            .code = std::error_code(errno, std::generic_category()),
-            .msg = fmt("Failed to open '%s'.", cue_name.c_str())
-        });
-    }
-
-    fprintf(f, "FILE \"%s\" BINARY\n\n", bin_name.c_str());
-
-    for (const Track &t : toc.tracks) {
-        if (t.is_data_track())
-            fprintf(f, "  TRACK %02u MODE2/2352\n", t.num);
-        else
-            fprintf(f, "  TRACK %02u AUDIO\n", t.num);
-
-        fprintf(f,
-                "    INDEX 01 %s\n\n",
-               t.msf_start().to_str().c_str());
-    }
-
-    fclose(f);
-    return {};
-}
-
-AppRes<void> write_toc(const TOC &toc, const std::string &bin_name, const std::string &toc_name) {
-    FILE *f = fopen(toc_name.c_str(), "w");
-    if (!f) {
-        return std::unexpected(AppErr{
-            .code = std::error_code(errno, std::generic_category()),
-            .msg = fmt("Failed to open '%s'.", toc_name.c_str())
-        });
-    }
-
-    fprintf(f, "CD_ROM\n\n");
-
-    for (const Track &t : toc.tracks) {
-        if (t.is_data_track())
-            fprintf(f, "TRACK MODE2_RAW\n");
-        else
-            fprintf(f, "TRACK AUDIO\n");
-
-        fprintf(f,
-                "    FILE \"%s\" %s\n\n",
-                bin_name.c_str(),
-                t.msf_len().to_str().c_str());
-    }
-
-    fclose(f);
-    return {};
 }
 
 // ---------------------------------------------------------
@@ -287,8 +93,8 @@ public:
 
     TOC get_toc() const noexcept { return m_toc; };
 
-    virtual AppRes<std::span<const byte>> read_sector(int sector, SectorReader &r) = 0;
-    virtual AppRes<std::span<const byte>> read_logical_sector(int sector, SectorReader &r) = 0;
+    virtual AppRes<std::span<const byte>> read_sector(int lba, SectorReader &r) = 0;
+    virtual AppRes<std::span<const byte>> read_logical_sector(int lba, const Track &t, SectorReader &r) = 0;
 
     virtual ~SectorSource() = default;
 };
@@ -341,12 +147,12 @@ class CDSource : public SectorSource {
                 });
             }
             
-            if (i > toc.first_track) toc.tracks.back().end_sector = toc_entry.cdte_addr.lba - 1;
+            if (i > toc.first_track) toc.tracks.back().end_lba = toc_entry.cdte_addr.lba - 1;
 
             toc.tracks.emplace_back(
                 i,
                 toc_entry.cdte_addr.lba, -1,
-                (u8)toc_entry.cdte_ctrl
+                toc_entry.cdte_ctrl & CDROM_DATA_TRACK
             );
         }
 
@@ -358,7 +164,7 @@ class CDSource : public SectorSource {
                     .msg = "Failed to read TOC entry for leadout."
                 });
             }
-            toc.tracks.back().end_sector = toc_entry.cdte_addr.lba - 1;
+            toc.tracks.back().end_lba = toc_entry.cdte_addr.lba - 1;
         }
 
         return toc;
@@ -421,29 +227,60 @@ public:
         return *this;
     }
 
-    AppRes<std::span<const byte>> read_sector(int sector, SectorReader &r) override {
-        if (this->fd < 0) throw std::invalid_argument("Invalid FD");
-
-        const MSF msf = MSF::from_lba(sector);
+    AppRes<std::span<const byte>> read_sector(int lba, SectorReader &r) override {
+        const MSF msf = MSF::from_lba(lba);
 
         struct cdrom_msf msf_;
         msf_.cdmsf_min0   = msf.min;
         msf_.cdmsf_sec0   = msf.sec;
         msf_.cdmsf_frame0 = msf.frame;
-        std::memcpy(r.raw_data.data(), &msf_, sizeof(struct cdrom_msf));
+        std::memcpy(r.raw_data.data(), &msf_, sizeof(struct cdrom_msf));  // mimicking union memory layout
 
         if (ioctl(fd, CDROMREADRAW, r.raw_data.data()) < 0) {
             return std::unexpected(AppErr {
                 .code = std::error_code(errno, std::generic_category()),
-                .msg = fmt("Failed to read sector '%d'.", sector)
+                .msg = fmt("Failed to read sector LBA = %d.", lba)
             });
         }
 
         return std::span(r.raw_data);
     }
     
-    AppRes<std::span<const byte>> read_logical_sector(int, SectorReader&) override {
-        throw std::logic_error("Can't read logical sectors from CD source.");
+    AppRes<std::span<const byte>> read_logical_sector(int lba, const Track &t, SectorReader& r) override {
+        const auto raw = this->read_sector(lba, r);
+        if (!raw) return std::unexpected(raw.error());
+
+        if (t.is_data_track) {
+            const u8 mode = r.raw_data[15];
+            switch (mode) {
+                case 1: {
+                    return std::span(r.raw_data.data() + 16, 2048);
+                }
+                case 2: {
+                    // struct {
+                    //     u8 file_num;
+                    //     u8 channel_num;
+                    //     u8 submode; // eor, video, audio, data, trigger, form, real-time, eof
+                    //     u8 coding_info;
+                    // } xa_header = {
+                    //     r.raw_data[16],
+                    //     r.raw_data[17],
+                    //     r.raw_data[18],
+                    //     r.raw_data[19],
+                    // };
+
+                    const u8 xa_form = (r.raw_data[18] >> 5) & 1;
+                    switch (xa_form) {
+                        case 0:  return std::span(r.raw_data.data() + 24, 2048);
+                        case 1:  return std::span(r.raw_data.data() + 24, 2324);
+                        default: throw std::runtime_error("messi!");
+                    }
+                }
+                default: throw std::runtime_error("penaldo!");
+            }
+        } else {
+            return std::span(r.raw_data);
+        }
     }
 
     ~CDSource() override {
@@ -452,56 +289,123 @@ public:
     }
 };
 
-// .bin + .cue source
-// class BinSource : public SectorSource {
-//     FILE *f = nullptr;
-// 
-// public:
-//     explicit BinSource(const std::string_view bin_path, const std::string_view cue_path) : SectorSource(true, false) {
-//         this->f = fopen(bin_path.data(), "rb");
-//         if (!this->f) {
-//             m_is_ready = false;
-//             m_reason = std::string("Failed to open file: ") + bin_path.data();
-//             return;
-//         }
-// 
-//         // ---
-//         FILE *cue_f = fopen(cue_path.data(), "r");
-//         if (!cue_f) {
-//             m_is_ready = false;
-//             m_reason = std::string("Failed to open file: ") + cue_path.data();
-//             return;
-//         }
-// 
-//         // read toc
-//     }
-// 
-//     BinSource(const BinSource&) = delete;
-//     BinSource(BinSource&& other) noexcept : SectorSource(true, false), f(other.f) { other.f = nullptr; }
-//     BinSource& operator=(const BinSource&) = delete;
-//     BinSource& operator=(BinSource&& other) noexcept {
-//         if (this != &other) {
-//             if (this->f) fclose(f);
-//             this->f = other.f;
-//             other.f = nullptr;
-//         }
-//         return *this;
-//     }
-// 
-//     AppRes<std::span<const byte>> read_sector(int, SectorReader&) override {
-//         if (!this->f) throw std::runtime_error("File not open.");
-//         throw std::runtime_error("Not implemetned yet.");
-//     }
-//     
-//     AppRes<std::span<const byte>> read_logical_sector(int, SectorReader&) override {
-//         throw std::logic_error("Not implemented yet.");
-//     }
-// 
-//     void close() override {
-//         if (this->f) fclose(this->f);
-//         this->f = nullptr;
-//     }
-// };
+// .bin+.cue/.toc source
+class BinSource : public SectorSource {  // !!!!!! WIP !!!!!!
+    FILE *f = nullptr;
+    Cue cue;
+
+public:
+    explicit BinSource(const std::string_view cue_path) : SectorSource(true, false) {
+        const auto cue = read_cue(cue_path);
+        if (!cue) {
+            const auto err = cue.error();
+
+            m_is_ready = false;
+            m_reason = fmt("Error: %s\n  Code %d: %s\n",
+                err.msg.c_str(),
+                err.code.value(), err.code.message().c_str()
+            );
+
+            return;
+        }
+
+        this->cue = cue.value();
+
+        if (this->cue.files.empty())  {
+            m_is_ready = false;
+            m_reason = "CUE contains no files.";
+            return;
+        } else if (this->cue.files.size() > 1) {
+            m_is_ready = false;
+            m_reason = "CUE contains multiple files.";
+            return;
+        }
+        if (this->cue.files.front().type != CueFileType::Binary) {
+            m_is_ready = false;
+            m_reason = "Only binary files are supported.";
+            return;
+        }
+
+        const fs::path cue_path_ = cue_path;
+        const fs::path bin_path = fs::weakly_canonical(cue_path_.parent_path() / cue->files.front().filename);
+        f = fopen(bin_path.c_str(), "rb");
+        if (!f) {
+            m_is_ready = false;
+            m_reason = fmt("Failed to open file: %s", bin_path.c_str());
+            return;
+        }
+    
+        // TODO: maybe a file size check?
+
+        m_toc.first_track = this->cue.files.front().tracks.front().num;
+        m_toc.last_track  = this->cue.files.front().tracks.back() .num;
+
+        for (const auto &t : this->cue.files.front().tracks) {
+            if (t._sector_size != RAW_SECTOR_SIZE) {
+                m_is_ready = false;
+                m_reason = "Only fully raw disc images are supported.";
+                return;
+            }
+
+            const int start_lba = t.indices.front().msf.to_sector();
+
+            if (!m_toc.tracks.empty()) m_toc.tracks.back().end_lba = start_lba - 1;
+            m_toc.tracks.emplace_back(
+                t.num,
+                start_lba, -1,
+                t.type != CueTrackType::Audio
+            );
+        }
+        if (!m_toc.tracks.empty()) {
+            fseek(f, 0, SEEK_END);
+            size_t bin_size = (size_t)ftell(f);
+            if (bin_size % RAW_SECTOR_SIZE != 0) {
+                m_is_ready = false;
+                m_reason = fmt("Binary file size isn't valid; it should be a multiple of %d", RAW_SECTOR_SIZE);
+                return;
+            } 
+            m_toc.tracks.back().end_lba = bin_size / RAW_SECTOR_SIZE;
+        }
+
+        m_is_ready = true;
+    }
+
+    BinSource(const BinSource&) = delete;
+    BinSource(BinSource&& other) noexcept : SectorSource(true, false), f(other.f) { other.f = nullptr; }
+    BinSource& operator=(const BinSource&) = delete;
+    BinSource& operator=(BinSource&& other) noexcept {
+        if (this != &other) {
+            if (this->f) fclose(f);
+            this->f = other.f;
+            other.f = nullptr;
+        }
+        return *this;
+    }
+
+    AppRes<std::span<const byte>> read_sector(int lba, SectorReader& r) override {
+        if (!this->f) throw std::runtime_error("File not open.");
+
+        size_t off = (size_t)lba * RAW_SECTOR_SIZE;
+        fseek(f, off, SEEK_SET);
+        if (fread(r.raw_data.data(), 1, RAW_SECTOR_SIZE, this->f) != RAW_SECTOR_SIZE) {
+            return std::unexpected(AppErr {
+                .code = std::error_code(errno, std::generic_category()),
+                .msg = fmt("Failed to read sector LBA = '%d'.", lba)
+            });;
+        }
+
+        return std::span(r.raw_data);
+    }
+    
+    AppRes<std::span<const byte>> read_logical_sector(int, const Track&, SectorReader&) override {
+        throw std::logic_error("Not implemented yet.");
+    }
+
+    ~BinSource() override {
+        if (this->f) fclose(this->f);
+        this->f = nullptr;
+    }
+};
 
 // ---------------------------------------------------------
 // Main
@@ -509,7 +413,7 @@ public:
 
 std::atomic<bool> g_run(true);
 
-void signal_handler(int sig) {
+void on_signal(int sig) {
     switch (sig) {
         case SIGINT: {
             g_run = false;
@@ -542,16 +446,16 @@ AppRes<void> probe(SectorSource &src) {
 
         const usize n_sectors = track.len();
 
-        if (track.is_data_track()) n_data_sectors += n_sectors;
+        if (track.is_data_track) n_data_sectors += n_sectors;
         else n_audio_sectors += n_sectors;
 
         printf("Track %2d: %5s | " MSF_FMT " (%06d) -> " MSF_FMT " (%06d) | " "Duration " MSF_FMT " (%6zu sectors, %8s)\n",
             track.num,
-            track.is_data_track() ? "data" : "audio",
+            track.is_data_track ? "data" : "audio",
             start.min, start.sec, start.frame,
-            track.start_sector,
+            track.start_lba,
             end.min, end.sec, end.frame,
-            track.end_sector,
+            track.end_lba,
             len.min, len.sec, len.frame,
             n_sectors,
             fmt_size(n_sectors * RAW_SECTOR_SIZE).c_str()
@@ -586,7 +490,7 @@ AppRes<void> raw_dump(SectorSource &src, bool seperate) {
 
     size_t _total_sectors = 0, _sectors_read = 0;
     for (const Track &t : toc.tracks)
-        _total_sectors += t.end_sector - t.start_sector + 1;
+        _total_sectors += t.end_lba - t.start_lba + 1;
 
     FILE *f = nullptr;
     if (!seperate) {
@@ -597,6 +501,10 @@ AppRes<void> raw_dump(SectorSource &src, bool seperate) {
                 .msg = "Failed to open 'disc.bin'."
             });
         }
+
+        byte buf[RAW_SECTOR_SIZE] = {0};
+        for (int i = 0; i < 150; i++)
+            fwrite(buf, RAW_SECTOR_SIZE, 1, f);
     }
 
     SectorReader reader;
@@ -619,7 +527,7 @@ AppRes<void> raw_dump(SectorSource &src, bool seperate) {
             }
         }
 
-        for (int i = t.start_sector; i <= t.end_sector; i++) {
+        for (int i = t.start_lba; i <= t.end_lba; i++) {
             if (!g_run.load()) {
                 complete = false;
                 printf("\nStopping safely.\n");
@@ -677,8 +585,6 @@ AppRes<void> raw_dump(SectorSource &src, bool seperate) {
     if (complete) {
         if (!seperate) {
             auto res = write_cue(toc, "disc.bin", "disc.cue");
-            if (!res) return std::unexpected(res.error());
-            res = write_toc(toc, "disc.bin", "disc.toc");
             if (!res) return std::unexpected(res.error());
         }
 
@@ -778,7 +684,7 @@ AppRes<void> extract(SectorSource &src) {
             break;
         }
 
-        const auto f_name = fmt("track%02d.%s", t.num, t.is_data_track() ? "data.bin" : "cda.wav");
+        const auto f_name = fmt("track%02d.%s", t.num, t.is_data_track ? "data.bin" : "cda.wav");
         f = fopen(f_name.c_str(), "wb");
         if (!f) {
             return std::unexpected(AppErr {
@@ -787,11 +693,11 @@ AppRes<void> extract(SectorSource &src) {
             });
         }
 
-        const auto& extract_sector = t.is_data_track()
+        const auto& extract_sector = t.is_data_track
             ? extract_data_sector
             : extract_audio_sector;
 
-        for (int i = t.start_sector; i <= t.end_sector; i++) {
+        for (int i = t.start_lba; i <= t.end_lba; i++) {
             if (!g_run.load()) {
                 complete = false;
                 printf("\nStopping safely.\n");
@@ -883,7 +789,8 @@ int main(int argc, char* argv[]) {
     }
 
     // ---
-    CDSource src("/dev/sr0");
+    // CDSource src("/dev/sr0");
+    BinSource src("assets/a6/disc.cue");
 
     const auto status = src.is_ready();
     if (!status.first) {
@@ -892,7 +799,7 @@ int main(int argc, char* argv[]) {
     }
     
     // ---
-    std::signal(SIGINT, signal_handler);
+    signal(SIGINT, on_signal);
 
     AppRes<void> res;
     switch (action) {
