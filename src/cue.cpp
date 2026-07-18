@@ -194,7 +194,7 @@ AppRes<void> write_cue(const TOC &toc, const std::string &bin_name, const std::s
     for (const Track &t : toc.tracks) {
         if (t.is_data_track) fprintf(f, "TRACK %02u MODE2/2352\n", t.num); // TODO: FIX: MODE2/2352 shouldn't be hardcoded!!!
         else                 fprintf(f, "TRACK %02u AUDIO\n"     , t.num);
-        fprintf(f, "INDEX 01 %s\n\n", t.msf_start().to_str().c_str());
+        fprintf(f, "INDEX 01 %s\n\n", MSF::from_sector(t.start_lba).to_str().c_str());
     }
 
     fclose(f);

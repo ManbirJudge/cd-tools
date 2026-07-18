@@ -97,6 +97,9 @@ public:
     virtual AppRes<std::span<const byte>> read_logical_sector(int lba, const Track &t, SectorReader &r) = 0;
 
     virtual ~SectorSource() = default;
+
+    virtual MSF lba_2_msf(int lba) = 0;
+    virtual int msf_2_lba(const MSF msf) = 0;
 };
 
 // CD source
@@ -228,7 +231,7 @@ public:
     }
 
     AppRes<std::span<const byte>> read_sector(int lba, SectorReader &r) override {
-        const MSF msf = MSF::from_lba(lba);
+        const MSF msf = MSF::from_sector(lba + 150);
 
         struct cdrom_msf msf_;
         msf_.cdmsf_min0   = msf.min;
@@ -287,6 +290,13 @@ public:
         if (this->fd >= 0) ::close(this->fd);
         this->fd = -1;
     }
+
+    MSF lba_2_msf(int lba) override {
+        return MSF::from_sector(lba + 150);
+    }
+    int msf_2_lba(const MSF msf) override {
+        return msf.to_sector() - 150;
+    } 
 };
 
 // .bin+.cue/.toc source
@@ -347,7 +357,7 @@ public:
                 return;
             }
 
-            const int start_lba = t.indices.front().msf.to_lba();
+            const int start_lba = t.indices.front().msf.to_sector(); // NOTE: NOT USING msf.to_lba() because convention in CUEs is different
 
             if (!m_toc.tracks.empty()) m_toc.tracks.back().end_lba = start_lba - 1;
             m_toc.tracks.emplace_back(
@@ -364,7 +374,7 @@ public:
                 m_reason = fmt("Binary file size isn't valid; it should be a multiple of %d", RAW_SECTOR_SIZE);
                 return;
             } 
-            m_toc.tracks.back().end_lba = bin_size / RAW_SECTOR_SIZE;
+            m_toc.tracks.back().end_lba = (bin_size / RAW_SECTOR_SIZE) - 1;
         }
 
         m_is_ready = true;
@@ -383,10 +393,9 @@ public:
     }
 
     AppRes<std::span<const byte>> read_sector(int lba, SectorReader& r) override {
-        if (!this->f) throw std::runtime_error("File not open.");
-
         size_t off = (size_t)lba * RAW_SECTOR_SIZE;
         fseek(f, off, SEEK_SET);
+
         if (fread(r.raw_data.data(), 1, RAW_SECTOR_SIZE, this->f) != RAW_SECTOR_SIZE) {
             return std::unexpected(AppErr {
                 .code = std::error_code(errno, std::generic_category()),
@@ -405,6 +414,13 @@ public:
         if (this->f) fclose(this->f);
         this->f = nullptr;
     }
+    
+    MSF lba_2_msf(int lba) override {
+        return MSF::from_sector(lba);
+    }
+    int msf_2_lba(const MSF msf) override {
+        return msf.to_sector();
+    } 
 };
 
 // ---------------------------------------------------------
@@ -440,8 +456,8 @@ AppRes<void> probe(SectorSource &src) {
     usize n_audio_sectors = 0;
 
     for (const Track &track : toc.tracks) {
-        const MSF start = track.msf_start();
-        const MSF end   = track.msf_end();
+        const MSF start = src.lba_2_msf(track.start_lba);
+        const MSF end   = src.lba_2_msf(track.end_lba  );
         const MSF len   = track.msf_len();
 
         const usize n_sectors = track.len();
@@ -534,8 +550,6 @@ AppRes<void> raw_dump(SectorSource &src, bool seperate) {
                 break;
             }
 
-            const MSF msf = MSF::from_lba(i);
-
             const auto data = src.read_sector(i, reader);
             if (!data) {
                 fclose(f);
@@ -553,6 +567,7 @@ AppRes<void> raw_dump(SectorSource &src, bool seperate) {
             // output diagnostics
             ++_sectors_read;
 
+            const MSF msf = src.lba_2_msf(i);
             const auto   _now = clock::now();
             const double _elapsed = std::chrono::duration<double>(_now - _start).count();
             const double _sectors_per_sec = _elapsed > 0.0 ? _sectors_read / _elapsed : 0.0;
